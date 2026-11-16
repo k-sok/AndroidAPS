@@ -1,0 +1,223 @@
+name: Build signed AAPS
+
+# Builds a signed fullRelease APK (phone + wear) of an official AAPS tag
+# from nightscout/AndroidAPS and uploads it to Google Drive.
+#
+# Safety rules for this file (public repo, signing key):
+# - Only workflow_dispatch. Only people with write access can start it.
+# - The secrets live in the GitHub Environment "signing", not in the repo secrets.
+#   Only a job that names this environment can read them.
+# - Each secret is given only to the one step that needs it.
+# - No `set -x` and no `echo` of secret values anywhere.
+# - The code that is built comes straight from the official repo, not from this fork.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'AAPS version tag from nightscout/AndroidAPS, for example 4.0.0'
+        required: true
+        default: '4.0.0'
+        type: string
+
+# Two runs at the same time could overwrite each other's upload.
+concurrency:
+  group: build-signed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and upload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: signing
+    steps:
+      - name: Check the tag text
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          # Only digits and dots, like 4.0.0 or 4.0.0.1. Nothing else is allowed.
+          if ! printf '%s' "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "❌ The tag must look like 4.0.0 (digits and dots only)."
+            exit 1
+          fi
+          echo "✅ Tag text is ok: $TAG"
+
+      - name: Check that all secrets exist
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          MISSING=0
+          check() {
+            if [ -z "$2" ]; then
+              echo "❌ Missing secret: $1"
+              MISSING=1
+            fi
+          }
+          check KEYSTORE_BASE64 "$KEYSTORE_BASE64"
+          check KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
+          check KEY_ALIAS "$KEY_ALIAS"
+          check KEY_PASSWORD "$KEY_PASSWORD"
+          check GDRIVE_CLIENT_ID "$GDRIVE_CLIENT_ID"
+          check GDRIVE_REFRESH_TOKEN "$GDRIVE_REFRESH_TOKEN"
+          if [ "$MISSING" -eq 1 ]; then
+            echo "🛑 Add the missing secrets to the Environment 'signing'."
+            exit 1
+          fi
+          echo "✅ All secrets are present."
+
+      - name: Decode the keystore file
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Check keystore, alias and passwords
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # No "set -x" here. It would print the passwords into a public log.
+          WORK_DIR=$(mktemp -d)
+          echo "test" > "$WORK_DIR/dummy.txt"
+          (cd "$WORK_DIR" && zip -q dummy.jar dummy.txt)
+          if ! jarsigner \
+              -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              "$WORK_DIR/dummy.jar" "$KEY_ALIAS" > "$WORK_DIR/jarsigner.log" 2>&1; then
+            echo "❌ The keystore, the alias or one of the passwords is wrong."
+            cat "$WORK_DIR/jarsigner.log"
+            exit 1
+          fi
+          echo "✅ Keystore, alias and passwords are valid."
+
+      - name: Get the source code of the tag from the official repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: nightscout/AndroidAPS
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Build the APKs
+        env:
+          # JDK 21 is already installed on the runner image.
+          JAVA_HOME: /usr/lib/jvm/temurin-21-jdk-amd64
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ ! -x "$JAVA_HOME/bin/java" ]; then
+            echo "❌ JDK 21 not found at $JAVA_HOME"
+            ls /usr/lib/jvm
+            exit 1
+          fi
+          java -version
+          chmod +x gradlew
+          ./gradlew :app:assembleFullRelease :wear:assembleFullRelease \
+            --no-daemon \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss4m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.workers.max=8 \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Rename the APKs
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p out
+          mv app/build/outputs/apk/full/release/*.apk "out/aaps-${TAG}.apk"
+          mv wear/build/outputs/apk/full/release/*.apk "out/aaps-wear-${TAG}.apk"
+          ls -l out
+
+      - name: Upload the APKs to Google Drive
+        env:
+          TAG: ${{ inputs.tag }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -e
+          API="https://www.googleapis.com/drive/v3/files"
+
+          echo "🔐 Getting a Google access token"
+          TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
+            -d client_id="$GDRIVE_CLIENT_ID" \
+            -d refresh_token="$GDRIVE_REFRESH_TOKEN" \
+            -d grant_type=refresh_token)
+          ACCESS_TOKEN=$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "❌ No access token. Google answered with this error:"
+            printf '%s' "$TOKEN_RESPONSE" | jq -r '.error, .error_description'
+            exit 1
+          fi
+          echo "::add-mask::$ACCESS_TOKEN"
+
+          # Finds a folder by name (and parent) or creates it. Prints the folder id.
+          find_or_create_folder() {
+            NAME=$1
+            PARENT=$2
+            QUERY="name='${NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            if [ -n "$PARENT" ]; then QUERY="$QUERY and '${PARENT}' in parents"; fi
+            ID=$(curl -s -G -H "Authorization: Bearer $ACCESS_TOKEN" \
+              --data-urlencode "q=$QUERY" "$API" | jq -r '.files[0].id // empty')
+            if [ -z "$ID" ]; then
+              if [ -n "$PARENT" ]; then
+                BODY=$(jq -n --arg n "$NAME" --arg p "$PARENT" \
+                  '{name:$n, mimeType:"application/vnd.google-apps.folder", parents:[$p]}')
+              else
+                BODY=$(jq -n --arg n "$NAME" \
+                  '{name:$n, mimeType:"application/vnd.google-apps.folder"}')
+              fi
+              ID=$(curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -H "Content-Type: application/json" -d "$BODY" "$API" | jq -r '.id // empty')
+            fi
+            if [ -z "$ID" ]; then
+              echo "❌ Could not find or create the folder $NAME" >&2
+              exit 1
+            fi
+            printf '%s' "$ID"
+          }
+
+          ROOT_ID=$(find_or_create_folder "AAPS" "")
+          VERSION_ID=$(find_or_create_folder "$TAG" "$ROOT_ID")
+
+          upload() {
+            FILE=$1
+            NAME=$(basename "$FILE")
+            # Remove an older file with the same name, so there is only one copy.
+            OLD_ID=$(curl -s -G -H "Authorization: Bearer $ACCESS_TOKEN" \
+              --data-urlencode "q=name='${NAME}' and '${VERSION_ID}' in parents and trashed=false" \
+              "$API" | jq -r '.files[0].id // empty')
+            if [ -n "$OLD_ID" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $ACCESS_TOKEN" "$API/$OLD_ID" > /dev/null
+            fi
+            META=$(jq -n --arg n "$NAME" --arg p "$VERSION_ID" '{name:$n, parents:[$p]}')
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -F "metadata=${META};type=application/json;charset=UTF-8" \
+              -F "file=@${FILE};type=application/vnd.android.package-archive" \
+              "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
+            if [ "$CODE" != "200" ] && [ "$CODE" != "201" ]; then
+              echo "❌ Upload of $NAME failed with HTTP status $CODE"
+              exit 1
+            fi
+            echo "✅ Uploaded $NAME"
+          }
+
+          upload "out/aaps-${TAG}.apk"
+          upload "out/aaps-wear-${TAG}.apk"
+          echo "🎉 Done. Look in Google Drive: AAPS / ${TAG}"
